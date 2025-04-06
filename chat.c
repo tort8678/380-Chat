@@ -9,6 +9,7 @@
 #include <getopt.h>
 #include "dh.h"
 #include "keys.h"
+#include "util.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -180,24 +181,10 @@ static gboolean shownewmessage(gpointer msg)
 	return 0;
 }
 
-int do_handshake(int sockfd, unsigned char *keybuf, size_t buflen) {
-	dhKey my_key;
-	dhKey peer_key;
-
-	// Initialize our dhKey
-	mpz_inits(my_key.SK, my_key.PK, NULL);
-	strncpy(my_key.name, "me", MAX_NAME);
-
-	// Generate our key pair
-	if (dhGenk(&my_key) != 0) {
-		fprintf(stderr, "dhGenk failed\n");
-		return -1;
-	}
-
-	// Serialize and send our public key
-	size_t pk_len = (mpz_sizeinbase(my_key.PK, 2) + 7) / 8;
+int send_mpz_t(int sockfd, mpz_t number) {
+    size_t pk_len = (mpz_sizeinbase(number, 2) + 7) / 8;
 	unsigned char *pk_buf = malloc(pk_len);
-	mpz_export(pk_buf, &pk_len, 1, 1, 1, 0, my_key.PK);
+	mpz_export(pk_buf, &pk_len, 1, 1, 1, 0, number);
 
 	uint16_t len_net = htons(pk_len);
 	if (write(sockfd, &len_net, 2) != 2 || write(sockfd, pk_buf, pk_len) != pk_len) {
@@ -206,36 +193,93 @@ int do_handshake(int sockfd, unsigned char *keybuf, size_t buflen) {
 		return -1;
 	}
 	free(pk_buf);
+	return 0;
+}
 
-	// Receive their public key
-	uint16_t peer_len_net;
+int recv_mpz_t(int sockfd, mpz_t number) {
+    uint16_t peer_len_net;
 	if (read(sockfd, &peer_len_net, 2) != 2) {
-		perror("read peer pk len");
+		perror("read peer key len");
 		return -1;
 	}
 
 	size_t peer_len = ntohs(peer_len_net);
 	unsigned char *peer_buf = malloc(peer_len);
 	if (read(sockfd, peer_buf, peer_len) != peer_len) {
-		perror("read peer pk");
+		perror("read peer key");
 		free(peer_buf);
 		return -1;
 	}
 
-	// Initialize peer dhKey
-	mpz_inits(peer_key.SK, peer_key.PK, NULL);
-	strncpy(peer_key.name, "peer", MAX_NAME);
-	mpz_import(peer_key.PK, peer_len, 1, 1, 1, 0, peer_buf);
+	mpz_import(number, peer_len, 1, 1, 1, 0, peer_buf);
 	free(peer_buf);
+	return 0;
+}
 
-	// Compute shared key
-	if (dhFinal(my_key.SK, my_key.PK, peer_key.PK, keybuf, buflen) != 0) {
-		fprintf(stderr, "dhFinal failed\n");
+void print_hex(const unsigned char *buf, size_t len) {
+    for (size_t i = 0; i < len; ++i)
+        printf("%02x", buf[i]);
+    printf("\n");
+}
+
+int doHandshake(int sockfd, unsigned char *keybuf, size_t buflen) {
+	/* Alice's long-term key: */
+	NEWZ(a); /* secret key (a random exponent) */
+	NEWZ(A); /* public key: A = g^a mod p */
+	dhGen(a,A);
+	// gmp_printf("Alice's secret key:%Zd\n", a);
+	// gmp_printf("Alice's public key:%Zd\n", A);
+	/* Alice's ephemeral key: */
+	NEWZ(x);
+	NEWZ(X);
+	dhGen(x,X);
+	// gmp_printf("Alice's secret key:%Zd\n", x);
+	// gmp_printf("Alice's public key:%Zd\n", X);
+	mpz_t B,Y; /* Bob's long-term public key and ephemeral key */
+	mpz_init(B);
+	mpz_init(Y);
+	ssize_t nbytes;
+	//need to send the length of keys in bytes before sending the keys so receiver knows how many bytes to read
+	// if((nbytes = send(sockfd,A,10,0)) == -1)
+	// 	error("send failed");
+	// if((nbytes = send(sockfd,X,10,0)) == -1)
+	// 	error("send failed");
+	// if(recv(sockfd,B,10,0) == -1){
+	// 	printf("user %d\n", isclient);
+	// 	error("recv failed");
+	// }
+	send_mpz_t(sockfd, A);
+	send_mpz_t(sockfd, X);
+	recv_mpz_t(sockfd, B);
+	recv_mpz_t(sockfd, Y);
+	gmp_printf("user %d public key:%Zd\n", isclient, B);
+	// if(recv(sockfd,Y,10,0) == -1){
+	// 	printf("user %d\n", isclient);
+	// 	error("recv failed");
+	// }
+	gmp_printf("user %d ephemeral key:%Zd\n", isclient, Y);
+
+	const size_t klen = 128;
+	/* Alice's key derivation: */
+	unsigned char kA[klen];
+	unsigned char kB[klen];
+	/* Bob's long-term key: */
+	dh3Final(a,A,x,X,B,Y,kA,klen);
+	if((nbytes = send(sockfd,kA,klen,0)) == -1)
+		error("send failed");
+	if(recv(sockfd,kB,klen,0) == -1){
+		printf("user %d, receiving kB\n", isclient);
+		error("recv failed");
+	}
+	if (memcmp(kA,kB,klen) == 0) {
+		printf("Alice and Bob have the same key :D\n");
+		memcpy(keybuf, kA, klen);
+		return 0;
+	}
+	else {
+		printf("T.T\n");
 		return -1;
 	}
-
-	mpz_clears(my_key.SK, my_key.PK, peer_key.PK, peer_key.SK, NULL);
-	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -289,14 +333,14 @@ int main(int argc, char *argv[])
 		initServerNet(port);
 	}
 	/* Handshake using dh */
-	unsigned char shared_key[32];
-	if (do_handshake(sockfd, shared_key, sizeof(shared_key)) != 0) {
+	unsigned char sharedKey[128];
+	if (doHandshake(sockfd, sharedKey, sizeof(sharedKey)) != 0) {
 		fprintf(stderr, "Handshake failed\n");
 		exit(1);
 	}
 	
 	printf("Shared key (first 8 bytes): ");
-	for (int i = 0; i < 8; i++) printf("%02x", shared_key[i]);
+	for (int i = 0; i < 8; i++) printf("%02x", sharedKey[i]);
 	printf("\n");
 
 	printf("Handshake successful. Shared secret established.\n");
