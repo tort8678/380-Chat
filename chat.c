@@ -82,8 +82,12 @@ static int initClientNet(char* hostname, int port)
 	serv_addr.sin_family = AF_INET;
 	memcpy(&serv_addr.sin_addr.s_addr,server->h_addr,server->h_length);
 	serv_addr.sin_port = htons(port);
+	// if connection is successful, begin the handshake
 	if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0)
 		error("ERROR connecting");
+	else {
+		fprintf(stderr, "connected to %s:%i\n",hostname,port);
+	}
 	/* at this point, should be able to send/recv on sockfd */
 	return 0;
 }
@@ -176,6 +180,64 @@ static gboolean shownewmessage(gpointer msg)
 	return 0;
 }
 
+int do_handshake(int sockfd, unsigned char *keybuf, size_t buflen) {
+	dhKey my_key;
+	dhKey peer_key;
+
+	// Initialize our dhKey
+	mpz_inits(my_key.SK, my_key.PK, NULL);
+	strncpy(my_key.name, "me", MAX_NAME);
+
+	// Generate our key pair
+	if (dhGenk(&my_key) != 0) {
+		fprintf(stderr, "dhGenk failed\n");
+		return -1;
+	}
+
+	// Serialize and send our public key
+	size_t pk_len = (mpz_sizeinbase(my_key.PK, 2) + 7) / 8;
+	unsigned char *pk_buf = malloc(pk_len);
+	mpz_export(pk_buf, &pk_len, 1, 1, 1, 0, my_key.PK);
+
+	uint16_t len_net = htons(pk_len);
+	if (write(sockfd, &len_net, 2) != 2 || write(sockfd, pk_buf, pk_len) != pk_len) {
+		perror("send pk");
+		free(pk_buf);
+		return -1;
+	}
+	free(pk_buf);
+
+	// Receive their public key
+	uint16_t peer_len_net;
+	if (read(sockfd, &peer_len_net, 2) != 2) {
+		perror("read peer pk len");
+		return -1;
+	}
+
+	size_t peer_len = ntohs(peer_len_net);
+	unsigned char *peer_buf = malloc(peer_len);
+	if (read(sockfd, peer_buf, peer_len) != peer_len) {
+		perror("read peer pk");
+		free(peer_buf);
+		return -1;
+	}
+
+	// Initialize peer dhKey
+	mpz_inits(peer_key.SK, peer_key.PK, NULL);
+	strncpy(peer_key.name, "peer", MAX_NAME);
+	mpz_import(peer_key.PK, peer_len, 1, 1, 1, 0, peer_buf);
+	free(peer_buf);
+
+	// Compute shared key
+	if (dhFinal(my_key.SK, my_key.PK, peer_key.PK, keybuf, buflen) != 0) {
+		fprintf(stderr, "dhFinal failed\n");
+		return -1;
+	}
+
+	mpz_clears(my_key.SK, my_key.PK, peer_key.PK, peer_key.SK, NULL);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	if (init("params") != 0) {
@@ -226,6 +288,18 @@ int main(int argc, char *argv[])
 	} else {
 		initServerNet(port);
 	}
+	/* Handshake using dh */
+	unsigned char shared_key[32];
+	if (do_handshake(sockfd, shared_key, sizeof(shared_key)) != 0) {
+		fprintf(stderr, "Handshake failed\n");
+		exit(1);
+	}
+	
+	printf("Shared key (first 8 bytes): ");
+	for (int i = 0; i < 8; i++) printf("%02x", shared_key[i]);
+	printf("\n");
+
+	printf("Handshake successful. Shared secret established.\n");
 
 	/* setup GTK... */
 	GtkBuilder* builder;
