@@ -10,6 +10,8 @@
 #include "dh.h"
 #include "keys.h"
 #include "util.h"
+#include <gmp.h>
+
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -22,6 +24,8 @@ static GtkTextMark*   mark; /* used for scrolling to end of transcript, etc */
 
 static pthread_t trecv;     /* wait for incoming messagess and post to queue */
 void* recvMsg(void*);       /* for trecv */
+size_t gmp_export_to_buf(unsigned char *buf, mpz_t num);
+
 
 #define max(a, b)         \
 	({ typeof(a) _a = a;    \
@@ -222,65 +226,172 @@ void print_hex(const unsigned char *buf, size_t len) {
     printf("\n");
 }
 
-int doHandshake(int sockfd, unsigned char *keybuf, size_t buflen) {
-	/* Alice's long-term key: */
-	NEWZ(a); /* secret key (a random exponent) */
-	NEWZ(A); /* public key: A = g^a mod p */
-	dhGen(a,A);
-	// gmp_printf("Alice's secret key:%Zd\n", a);
-	// gmp_printf("Alice's public key:%Zd\n", A);
-	/* Alice's ephemeral key: */
-	NEWZ(x);
-	NEWZ(X);
-	dhGen(x,X);
-	// gmp_printf("Alice's secret key:%Zd\n", x);
-	// gmp_printf("Alice's public key:%Zd\n", X);
-	mpz_t B,Y; /* Bob's long-term public key and ephemeral key */
-	mpz_init(B);
-	mpz_init(Y);
-	ssize_t nbytes;
-	//need to send the length of keys in bytes before sending the keys so receiver knows how many bytes to read
-	// if((nbytes = send(sockfd,A,10,0)) == -1)
-	// 	error("send failed");
-	// if((nbytes = send(sockfd,X,10,0)) == -1)
-	// 	error("send failed");
-	// if(recv(sockfd,B,10,0) == -1){
-	// 	printf("user %d\n", isclient);
-	// 	error("recv failed");
-	// }
-	send_mpz_t(sockfd, A);
-	send_mpz_t(sockfd, X);
-	recv_mpz_t(sockfd, B);
-	recv_mpz_t(sockfd, Y);
-	gmp_printf("user %d public key:%Zd\n", isclient, B);
-	// if(recv(sockfd,Y,10,0) == -1){
-	// 	printf("user %d\n", isclient);
-	// 	error("recv failed");
-	// }
-	gmp_printf("user %d ephemeral key:%Zd\n", isclient, Y);
-
-	const size_t klen = 128;
-	/* Alice's key derivation: */
-	unsigned char kA[klen];
-	unsigned char kB[klen];
-	/* Bob's long-term key: */
-	dh3Final(a,A,x,X,B,Y,kA,klen);
-	if((nbytes = send(sockfd,kA,klen,0)) == -1)
-		error("send failed");
-	if(recv(sockfd,kB,klen,0) == -1){
-		printf("user %d, receiving kB\n", isclient);
-		error("recv failed");
-	}
-	if (memcmp(kA,kB,klen) == 0) {
-		printf("Alice and Bob have the same key :D\n");
-		memcpy(keybuf, kA, klen);
-		return 0;
-	}
-	else {
-		printf("T.T\n");
-		return -1;
-	}
+void printString(unsigned char str[],int len) {
+	for (int i = 0; i < len; ++i)
+		printf("%c", str[i]);
 }
+
+void getTranscriptHash(unsigned char *out, mpz_t A, mpz_t B, mpz_t X, mpz_t Y) {
+    // Calculate expected byte lengths from each number.
+    size_t lenA = (mpz_sizeinbase(A, 2) + 7) / 8;
+    size_t lenB = (mpz_sizeinbase(B, 2) + 7) / 8;
+    size_t lenX = (mpz_sizeinbase(X, 2) + 7) / 8;
+    size_t lenY = (mpz_sizeinbase(Y, 2) + 7) / 8;
+    size_t total_len = lenA + lenB + lenX + lenY;
+    printf("lenA: %zu, lenB: %zu, lenX: %zu, lenY: %zu\n", lenA, lenB, lenX, lenY);
+    printf("Total concatenated length: %zu\n", total_len);
+
+    // Allocate a buffer large enough for all exported bytes.
+    unsigned char *buf = malloc(total_len);
+    if (!buf) {
+        perror("malloc failed");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t offset = 0;
+    size_t countA, countB, countX, countY;
+
+    // Export A into the buffer
+    mpz_export(buf + offset, &countA, 1, 1, 1, 0, A);
+    printf("Exported A: %zu bytes\n", countA);
+    offset += countA;
+
+    // Export B into the buffer
+    mpz_export(buf + offset, &countB, 1, 1, 1, 0, B);
+    printf("Exported B: %zu bytes\n", countB);
+    offset += countB;
+
+    // Export X into the buffer
+    mpz_export(buf + offset, &countX, 1, 1, 1, 0, X);
+    printf("Exported X: %zu bytes\n", countX);
+    offset += countX;
+
+    // Export Y into the buffer
+    mpz_export(buf + offset, &countY, 1, 1, 1, 0, Y);
+    printf("Exported Y: %zu bytes\n", countY);
+    offset += countY;
+
+    printf("Final offset after export: %zu\n", offset);
+    if (offset > total_len) {
+        fprintf(stderr, "Error: Offset exceeds allocated buffer size!\n");
+        free(buf);
+        exit(EXIT_FAILURE);
+    }
+
+    // Now compute the SHA256 hash over the concatenated buffer.
+    SHA256(buf, offset, out);
+
+    free(buf);
+}
+
+size_t gmp_export_to_buf(unsigned char *buf, mpz_t num) {
+	size_t pk_len = (mpz_sizeinbase(num, 2) + 7) / 8;
+    return (size_t)mpz_export(buf, &pk_len, 1, 1, 1, 0, num);
+}
+
+int performMutualAuthentication(int sockfd, unsigned char *kA, size_t klen, 
+    unsigned char *transcript_hash, unsigned char *kB_mac) {
+    // Alice's MAC from shared key
+    unsigned char alice_mac[SHA256_DIGEST_LENGTH];
+    if (HMAC(EVP_sha256(), kA, klen, transcript_hash, SHA256_DIGEST_LENGTH, alice_mac, NULL) == NULL) {
+        perror("HMAC failed");
+        return -1;
+    }
+    
+    // Send Alice's MAC to Bob
+    if (send(sockfd, alice_mac, SHA256_DIGEST_LENGTH, 0) == -1) {
+        perror("send failed");
+        return -1;
+    }
+
+    // Receive Bob's MAC
+    if (recv(sockfd, kB_mac, SHA256_DIGEST_LENGTH, 0) == -1) {
+        perror("recv failed");
+        return -1;
+    }
+
+    // Verify received MAC
+    unsigned char expected_mac[SHA256_DIGEST_LENGTH];
+    HMAC(EVP_sha256(), kA, klen, transcript_hash, SHA256_DIGEST_LENGTH, expected_mac, NULL);
+
+    if (memcmp(expected_mac, kB_mac, SHA256_DIGEST_LENGTH) == 0) {
+        printf("Mutual authentication succeeded!\n");
+        return 0;  // Success
+    } else {
+        printf("Mutual authentication failed!\n");
+        return -1;  // Failure
+    }
+}
+
+int doHandshake(int sockfd, unsigned char *keybuf, size_t buflen) {
+    /* Alice's long-term key: */
+    NEWZ(a); /* secret key (a random exponent) */
+    NEWZ(A); /* public key: A = g^a mod p */
+    dhGen(a, A);
+    
+    /* Alice's ephemeral key: */
+    NEWZ(x);
+    NEWZ(X);
+    dhGen(x, X);
+
+    mpz_t B, Y; /* Bob's long-term public key and ephemeral key */
+    mpz_init(B);
+    mpz_init(Y);
+    
+    ssize_t nbytes;
+    send_mpz_t(sockfd, A);
+    send_mpz_t(sockfd, X);
+    recv_mpz_t(sockfd, B);
+    recv_mpz_t(sockfd, Y);
+
+    // gmp_printf("user %d public key:%Zd\n", isclient, B);
+    // gmp_printf("user %d ephemeral key:%Zd\n", isclient, Y);
+
+    const size_t klen = 128;
+    /* Alice's key derivation: */
+    unsigned char kA[klen];
+    unsigned char kB[klen];
+    dh3Final(a, A, x, X, B, Y, kA, klen);
+
+    // Send Alice's shared key kA to Bob
+    if ((nbytes = send(sockfd, kA, klen, 0)) == -1)
+        error("send failed");
+
+    // Receive Bob's shared key kB
+    if (recv(sockfd, kB, klen, 0) == -1) {
+        printf("user %d, receiving kB\n", isclient);
+        error("recv failed");
+    }
+
+    // Key verification: Ensure that both Alice and Bob share the same key
+    if (memcmp(kA, kB, klen) == 0) {
+        printf("Alice and Bob have the same key :D\n");
+        memcpy(keybuf, kA, klen);
+    } else {
+        printf("Key mismatch! Authentication failed.\n");
+        return -1;
+    }
+
+    // Now perform mutual authentication at the end:
+	unsigned char transcript_hash[SHA256_DIGEST_LENGTH];
+	if (isclient) {
+		// For the client, her long-term key A and ephemeral X correspond
+		// to the server's keys on the other side.
+		// So we swap them: Use B and Y in the first positions.
+		getTranscriptHash(transcript_hash, B, A, Y, X);
+	} else {
+		// For the server, the keys are already in the proper order.
+		getTranscriptHash(transcript_hash, A, B, X, Y);
+	}
+    unsigned char kB_mac[SHA256_DIGEST_LENGTH]; // For receiving Bob's MAC
+
+    // Perform mutual authentication with kA, transcript_hash, and kB_mac
+    performMutualAuthentication(sockfd, kA, klen, transcript_hash, kB_mac);
+	return 0;
+}
+
+
+
 
 int main(int argc, char *argv[])
 {
@@ -344,6 +455,7 @@ int main(int argc, char *argv[])
 	printf("\n");
 
 	printf("Handshake successful. Shared secret established.\n");
+
 
 	/* setup GTK... */
 	GtkBuilder* builder;
