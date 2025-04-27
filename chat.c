@@ -11,6 +11,10 @@
 #include "keys.h"
 #include "util.h"
 #include <gmp.h>
+#include <openssl/rand.h>
+
+#define AES_BLOCK_SIZE 16
+#define HMAC_SIZE 32
 
 
 #ifndef PATH_MAX
@@ -42,6 +46,168 @@ static void error(const char *msg)
 	perror(msg);
 	exit(EXIT_FAILURE);
 }
+
+int secure_send(const char *plaintext, int sockfd, unsigned char *key)
+{
+    int plaintext_len = strlen(plaintext);
+    unsigned char iv[AES_BLOCK_SIZE];
+    unsigned char ciphertext[1024];
+    unsigned char hmac[HMAC_SIZE];
+    int len, ciphertext_len;
+
+    // 1. Generate random IV
+    if (!RAND_bytes(iv, AES_BLOCK_SIZE)) {
+        perror("IV generation failed");
+        return -1;
+    }
+
+    // 2. Encrypt plaintext using AES-256-CBC
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        perror("EVP_CIPHER_CTX_new failed");
+        return -1;
+    }
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+        perror("EncryptInit failed");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+
+    if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char *)plaintext, plaintext_len) != 1) {
+        perror("EncryptUpdate failed");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    ciphertext_len = len;
+
+    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
+        perror("EncryptFinal failed");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    ciphertext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    // 3. Calculate HMAC over (IV + ciphertext)
+    HMAC(EVP_sha256(), key, 32, iv, AES_BLOCK_SIZE, hmac, NULL);
+    HMAC(EVP_sha256(), key, 32, ciphertext, ciphertext_len, hmac, NULL);
+
+    // 4. Send IV
+    if (send(sockfd, iv, AES_BLOCK_SIZE, 0) != AES_BLOCK_SIZE) {
+        perror("send IV failed");
+        return -1;
+    }
+
+    // 5. Send ciphertext length (as uint16_t)
+    uint16_t cipher_len_net = htons(ciphertext_len);
+    if (send(sockfd, &cipher_len_net, sizeof(cipher_len_net), 0) != sizeof(cipher_len_net)) {
+        perror("send length failed");
+        return -1;
+    }
+
+    // 6. Send ciphertext
+    if (send(sockfd, ciphertext, ciphertext_len, 0) != ciphertext_len) {
+        perror("send ciphertext failed");
+        return -1;
+    }
+
+    // 7. Send HMAC
+    if (send(sockfd, hmac, HMAC_SIZE, 0) != HMAC_SIZE) {
+        perror("send HMAC failed");
+        return -1;
+    }
+
+    return 0;
+}
+int secure_recv(int sockfd, unsigned char *key, char **plaintext_out)
+{
+    unsigned char iv[AES_BLOCK_SIZE];
+    unsigned char ciphertext[1024];
+    unsigned char hmac_received[HMAC_SIZE];
+    unsigned char hmac_expected[HMAC_SIZE];
+    uint16_t cipher_len_net;
+    int ciphertext_len, len;
+    int plaintext_len;
+    unsigned char *plaintext;
+
+    // 1. Receive IV
+    if (recv(sockfd, iv, AES_BLOCK_SIZE, MSG_WAITALL) != AES_BLOCK_SIZE) {
+        perror("recv IV failed");
+        return -1;
+    }
+
+    // 2. Receive ciphertext length
+    if (recv(sockfd, &cipher_len_net, sizeof(cipher_len_net), MSG_WAITALL) != sizeof(cipher_len_net)) {
+        perror("recv length failed");
+        return -1;
+    }
+    ciphertext_len = ntohs(cipher_len_net);
+
+    // 3. Receive ciphertext
+    if (recv(sockfd, ciphertext, ciphertext_len, MSG_WAITALL) != ciphertext_len) {
+        perror("recv ciphertext failed");
+        return -1;
+    }
+
+    // 4. Receive HMAC
+    if (recv(sockfd, hmac_received, HMAC_SIZE, MSG_WAITALL) != HMAC_SIZE) {
+        perror("recv HMAC failed");
+        return -1;
+    }
+
+    // 5. Verify HMAC over (IV + ciphertext)
+    HMAC(EVP_sha256(), key, 32, iv, AES_BLOCK_SIZE, hmac_expected, NULL);
+    HMAC(EVP_sha256(), key, 32, ciphertext, ciphertext_len, hmac_expected, NULL);
+
+    if (memcmp(hmac_expected, hmac_received, HMAC_SIZE) != 0) {
+        fprintf(stderr, "HMAC verification failed\n");
+        return -1;
+    }
+
+    // 6. Decrypt ciphertext
+    plaintext = malloc(ciphertext_len + 1);
+    if (!plaintext) {
+        perror("malloc failed");
+        return -1;
+    }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        perror("EVP_CIPHER_CTX_new failed");
+        free(plaintext);
+        return -1;
+    }
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+        perror("DecryptInit failed");
+        EVP_CIPHER_CTX_free(ctx);
+        free(plaintext);
+        return -1;
+    }
+
+    if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len) != 1) {
+        perror("DecryptUpdate failed");
+        EVP_CIPHER_CTX_free(ctx);
+        free(plaintext);
+        return -1;
+    }
+    plaintext_len = len;
+
+    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1) {
+        perror("DecryptFinal failed");
+        EVP_CIPHER_CTX_free(ctx);
+        free(plaintext);
+        return -1;
+    }
+    plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    plaintext[plaintext_len] = 0; // Null terminate
+
+    *plaintext_out = (char *)plaintext;
+    return 0;
+}
+
 
 int initServerNet(int port)
 {
@@ -151,28 +317,28 @@ static void tsappend(char* message, char** tagnames, int ensurenewline)
 	gtk_text_buffer_delete_mark(tbuf,mark);
 }
 
-static void sendMessage(GtkWidget* w /* <-- msg entry widget */, gpointer /* data */)
+static void sendMessage(GtkWidget* w, gpointer /* data */)
 {
 	char* tags[2] = {"self",NULL};
 	tsappend("me: ",tags,0);
-	GtkTextIter mstart; /* start of message pointer */
-	GtkTextIter mend;   /* end of message pointer */
+	GtkTextIter mstart;
+	GtkTextIter mend;
 	gtk_text_buffer_get_start_iter(mbuf,&mstart);
 	gtk_text_buffer_get_end_iter(mbuf,&mend);
 	char* message = gtk_text_buffer_get_text(mbuf,&mstart,&mend,1);
-	size_t len = g_utf8_strlen(message,-1);
-	/* XXX we should probably do the actual network stuff in a different
-	 * thread and have it call this once the message is actually sent. */
-	ssize_t nbytes;
-	if ((nbytes = send(sockfd,message,len,0)) == -1)
-		error("send failed");
+
+	// SECURE SEND
+	if (secure_send(message, sockfd, sharedKey) != 0)
+		error("secure send failed");
 
 	tsappend(message,NULL,1);
 	free(message);
-	/* clear message text and reset focus */
+
 	gtk_text_buffer_delete(mbuf,&mstart,&mend);
 	gtk_widget_grab_focus(w);
 }
+
+
 
 static gboolean shownewmessage(gpointer msg)
 {
@@ -508,23 +674,18 @@ int main(int argc, char *argv[])
  * main loop for processing: */
 void* recvMsg(void*)
 {
-	size_t maxlen = 512;
-	char msg[maxlen+2]; /* might add \n and \0 */
-	ssize_t nbytes;
 	while (1) {
-		if ((nbytes = recv(sockfd,msg,maxlen,0)) == -1)
-			error("recv failed");
-		if (nbytes == 0) {
-			/* XXX maybe show in a status message that the other
-			 * side has disconnected. */
+		char *plaintext = NULL;
+
+		// SECURE RECEIVE
+		if (secure_recv(sockfd, sharedKey, &plaintext) != 0) {
+			fprintf(stderr, "secure receive failed or connection closed\n");
 			return 0;
 		}
-		char* m = malloc(maxlen+2);
-		memcpy(m,msg,nbytes);
-		if (m[nbytes-1] != '\n')
-			m[nbytes++] = '\n';
-		m[nbytes] = 0;
-		g_main_context_invoke(NULL,shownewmessage,(gpointer)m);
+
+		// Show new message
+		g_main_context_invoke(NULL,shownewmessage,(gpointer)plaintext);
 	}
 	return 0;
 }
+
